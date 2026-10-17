@@ -5,13 +5,13 @@ import { randomUUID } from 'crypto';
 import type { UserRole, LoginResponse, LogoutResponse, MeResponse } from '@lumen/types';
 
 import { identityStore } from '../repositories/identity.repository.js';
-import { sessionStore } from '../repositories/session.repository.js';
+import { makeSession, sessionStore } from '../repositories/session.repository.js';
 import { accessTokenSigner } from '../services/token.service.js';
-import { accountStatusError, authErrorStatus, normalizeAuthError } from '../utils/errors.js';
-import { validatePassword } from '../utils/validators.js';
-import { makeSession } from '../utils/session.factory.js';
-import { authLogger } from '../utils/logger.js';
-import { incrementMetric, getAuthMetricsSnapshot } from '../utils/metrics.js';
+import { accountStatusError } from '../services/account-status.service.js';
+import { getAuthMetricsSnapshot, incrementMetric } from '../services/metrics.service.js';
+import { authErrorStatus, normalizeAuthError } from '../../../shared/errors/index.js';
+import { authLogger } from '../../../shared/logger/index.js';
+import { validatePassword } from '../validators/password.validator.js';
 import { limited } from '../utils/rate-limiter.js';
 import { AuthGuard } from '../guards/auth.guard.js';
 import { AuthContext } from '../../../shared/decorators/auth-context.decorator.js';
@@ -135,9 +135,39 @@ export class AuthController {
       incrementMetric("auth_refresh_failure_total");
       throw new HttpException({ error: "AUTH_TOKEN_INVALID", message: "invalid refresh token" }, authErrorStatus("AUTH_TOKEN_INVALID"));
     }
-    sessionStore.revokeByRefreshToken(refreshToken);
     const identity = identityStore.findById(existing.userId);
-    const role = identity?.role ?? "owner";
+    // #1303: a refresh token must not outlive the identity it belongs to. Before
+    // this, a missing identity fell back to `role = "owner"`, so a token issued
+    // before the store was cleared minted the highest role — the login path
+    // always failed for unknown identities, refresh did the opposite.
+    if (!identity) {
+      sessionStore.revokeByRefreshToken(refreshToken);
+      incrementMetric("auth_refresh_failure_total");
+      authLogger.warn("auth.token.revoked", {
+        requestId,
+        meta: { reason: "AUTH_TOKEN_INVALID", cause: "identity_missing" },
+      });
+      throw new HttpException(
+        { error: "AUTH_TOKEN_INVALID", message: "invalid refresh token" },
+        authErrorStatus("AUTH_TOKEN_INVALID"),
+      );
+    }
+
+    const statusError = accountStatusError(identity.status);
+    if (statusError) {
+      // locked / suspended / pending: the account lost access, so must the session.
+      sessionStore.revokeByRefreshToken(refreshToken);
+      incrementMetric("auth_refresh_failure_total");
+      authLogger.warn("auth.token.revoked", {
+        requestId,
+        userId: identity.userId,
+        meta: { reason: statusError.error, cause: `identity_${identity.status}` },
+      });
+      throw new HttpException(statusError, authErrorStatus(statusError.error));
+    }
+
+    sessionStore.revokeByRefreshToken(refreshToken);
+    const role = identity.role;
     const nextAccess = accessTokenSigner.sign({ sub: existing.userId, clinicId: existing.clinicId, role });
     const nextRefresh = randomUUID();
     seenRefreshTokens.add(nextRefresh);
